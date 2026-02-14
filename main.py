@@ -1,293 +1,319 @@
-import io
-import math
 import asyncio
-import traceback
 import base64
+import inspect
+import io
+import json
+import re
+import time
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-import aiohttp
-from PIL import Image, ImageDraw, ImageSequence
+from PIL import Image
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.message_components import Image as ImgComp
-
-try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-except ImportError:
-    AiocqhttpMessageEvent = None
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
 
 
-@register("touch_head", "摸头杀插件", "当用户拍机器人时自动生成并发送摸头GIF动图", "1.1.0")
-class TouchHeadPlugin(Star):
-    QQ_AVATAR_URL = "https://q.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640&img_type=jpg"
-    QQ_AVATAR_URL_ALT = "https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-    
+DEFAULT_CONFIG = {
+    "trigger": "摸摸",
+    "interval": 0.06,
+}
+
+
+@register("astrbot_plugin_petpet", "codex", "摸头杀 petpet GIF 插件", "1.0.0")
+class PetPetPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.data_dir = Path("data/touch_head")
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._session: Optional[aiohttp.ClientSession] = None
-    
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(ssl=False)
-            self._session = aiohttp.ClientSession(connector=connector)
-        return self._session
-    
-    async def initialize(self):
-        logger.info("摸头杀插件初始化完成")
-    
-    async def _get_qq_avatar(self, user_id: str) -> Optional[Image.Image]:
-        urls = [
-            self.QQ_AVATAR_URL.format(user_id=user_id),
-            self.QQ_AVATAR_URL_ALT.format(user_id=user_id),
-        ]
-        
-        for url in urls:
+        self.base_dir = Path(__file__).resolve().parent
+        self.assets_dir = self.base_dir / "data" / "petpet"
+        self.output_dir = self.assets_dir / "output"
+        self.config_path = self.base_dir / "config.json"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.config = self._load_or_create_config()
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup_gif_loop())
+        logger.info("[petpet] 插件已加载，定时清理任务已启动")
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_message(self, event: AstrMessageEvent):
+        text = self._get_text(event).strip()
+        if not text:
+            return
+
+        if text.startswith(".petset"):
+            if not await self._is_admin_or_owner(event):
+                yield event.plain_result("你没有权限使用该命令（仅机器人管理员或群主）。")
+                return
+            msg = self._handle_petset(text)
+            yield event.plain_result(msg)
+            return
+
+        trigger = str(self.config.get("trigger", DEFAULT_CONFIG["trigger"])).strip()
+        if not (text == trigger or text.startswith(trigger + " ")):
+            return
+
+        if not self._assets_ready():
+            logger.error("[petpet] 缺少素材，请检查 data/petpet/frame0.png ~ frame4.png")
+            yield event.plain_result("petpet 素材缺失，请联系管理员检查插件目录下 data/petpet/frame0~4.png")
+            return
+
+        target_user_id = self._resolve_target_user_id(event)
+        if not target_user_id:
+            yield event.plain_result("请使用“摸摸 @某人”，或回复某人消息后发送“摸摸”。")
+            return
+
+        avatar = await self._resolve_avatar(event, target_user_id)
+        if avatar is None:
+            yield event.plain_result("未能获取目标头像（仅支持本地路径/字节/base64，不进行网络下载）。")
+            return
+
+        try:
+            gif_path = self._build_petpet_gif(avatar, float(self.config["interval"]))
+        except Exception:
+            logger.exception("[petpet] 生成 GIF 失败")
+            yield event.plain_result("生成 petpet GIF 失败，请稍后再试。")
+            return
+
+        yield self._image_result(event, gif_path)
+
+    def _load_or_create_config(self) -> dict:
+        cfg = dict(DEFAULT_CONFIG)
+        if self.config_path.exists():
             try:
-                session = await self._get_session()
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-                async with session.get(
-                    url, 
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    headers=headers
-                ) as resp:
-                    logger.info(f"请求头像URL: {url}, 状态码: {resp.status}")
-                    if resp.status == 200:
-                        img_data = await resp.read()
-                        if len(img_data) > 0:
-                            img = Image.open(io.BytesIO(img_data))
-                            return img.convert("RGBA")
-                        else:
-                            logger.warning(f"头像数据为空: {url}")
-            except asyncio.TimeoutError:
-                logger.error(f"获取QQ头像超时: {url}")
-            except aiohttp.ClientError as e:
-                logger.error(f"网络请求失败: {e}")
-            except Exception as e:
-                logger.error(f"获取QQ头像失败: {e}\n{traceback.format_exc()}")
-        
+                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
+            except Exception:
+                logger.exception("[petpet] 读取 config.json 失败，将使用默认配置")
+        self._normalize_and_save_config(cfg)
+        return self.config
+
+    def _normalize_and_save_config(self, cfg: dict):
+        trigger = str(cfg.get("trigger", DEFAULT_CONFIG["trigger"])).strip() or DEFAULT_CONFIG["trigger"]
+        try:
+            interval = float(cfg.get("interval", DEFAULT_CONFIG["interval"]))
+        except Exception:
+            interval = DEFAULT_CONFIG["interval"]
+        interval = max(0.02, min(1.0, interval))
+        self.config = {"trigger": trigger, "interval": interval}
+        self.config_path.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _handle_petset(self, text: str) -> str:
+        m = re.match(r"^\.petset\s+(速度|指令)\s+(.+?)\s*$", text)
+        if not m:
+            return "用法：.petset 速度 0.06 或 .petset 指令 揉揉"
+        key, value = m.group(1), m.group(2).strip()
+        if key == "速度":
+            try:
+                interval = float(value)
+            except Exception:
+                return "速度必须是数字，例如：.petset 速度 0.06"
+            if interval <= 0:
+                return "速度必须大于 0。"
+            self.config["interval"] = interval
+            self._normalize_and_save_config(self.config)
+            return f"已设置摸头速度（帧间隔）为 {self.config['interval']:.3f}s"
+        if not value:
+            return "触发词不能为空。"
+        self.config["trigger"] = value
+        self._normalize_and_save_config(self.config)
+        return f"已设置触发词为：{self.config['trigger']}"
+
+    async def _is_admin_or_owner(self, event: AstrMessageEvent) -> bool:
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        role = str(getattr(sender, "role", "")).lower()
+        if role in {"owner", "admin"}:
+            return True
+
+        for name in ("is_admin", "is_owner"):
+            checker = getattr(event, name, None)
+            if callable(checker):
+                try:
+                    ret = checker()
+                    if inspect.isawaitable(ret):
+                        ret = await ret
+                    if bool(ret):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _resolve_target_user_id(self, event: AstrMessageEvent) -> Optional[str]:
+        msg_obj = getattr(event, "message_obj", None)
+        chain = getattr(msg_obj, "message", None) or []
+        at_uid = None
+        reply_uid = None
+
+        for seg in chain:
+            t = seg.__class__.__name__.lower()
+            if t == "at" and at_uid is None:
+                at_uid = self._first_attr(seg, ("qq", "user_id", "id", "target"))
+            if t in {"reply", "quote"} and reply_uid is None:
+                reply_uid = self._first_attr(seg, ("user_id", "qq", "id", "target"))
+
+        if reply_uid is None:
+            raw = getattr(msg_obj, "raw_message", None)
+            reply_uid = self._extract_reply_uid(raw)
+
+        return str(at_uid or reply_uid) if (at_uid or reply_uid) else None
+
+    def _extract_reply_uid(self, raw: Any) -> Optional[str]:
+        if not isinstance(raw, dict):
+            return None
+        paths = [
+            ("reply", "user_id"),
+            ("reply", "sender_id"),
+            ("reply", "sender", "user_id"),
+            ("quote", "user_id"),
+            ("quote", "sender", "user_id"),
+            ("reference", "author", "id"),
+        ]
+        for p in paths:
+            cur = raw
+            ok = True
+            for key in p:
+                if not isinstance(cur, dict) or key not in cur:
+                    ok = False
+                    break
+                cur = cur[key]
+            if ok and cur:
+                return str(cur)
         return None
-    
-    def _generate_petpet_gif(self, avatar: Image.Image) -> bytes:
-        canvas_size = 256
-        avatar_size = 180
-        avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
-        
+
+    async def _resolve_avatar(self, event: AstrMessageEvent, user_id: str) -> Optional[Image.Image]:
+        candidates = []
+        for name in ("get_user_avatar", "get_avatar", "get_target_avatar", "get_sender_avatar"):
+            fn = getattr(event, name, None)
+            if callable(fn):
+                try:
+                    data = fn() if name == "get_sender_avatar" else fn(user_id)
+                    if inspect.isawaitable(data):
+                        data = await data
+                    candidates.append(data)
+                except Exception:
+                    continue
+
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        sender_uid = self._first_attr(sender, ("user_id", "id"))
+        if sender and sender_uid and str(sender_uid) == str(user_id):
+            for k in ("avatar", "avatar_url", "face", "icon"):
+                v = getattr(sender, k, None)
+                if v:
+                    candidates.append(v)
+
+        for data in candidates:
+            img = self._to_image(data)
+            if img is not None:
+                return img.convert("RGBA")
+        return None
+
+    def _to_image(self, data: Any) -> Optional[Image.Image]:
+        if data is None:
+            return None
+        if isinstance(data, Image.Image):
+            return data
+        if isinstance(data, (bytes, bytearray)):
+            try:
+                return Image.open(io.BytesIO(data)).convert("RGBA")
+            except Exception:
+                return None
+        if isinstance(data, str):
+            text = data.strip()
+            if text.startswith("http://") or text.startswith("https://"):
+                return None
+            if text.startswith("data:image"):
+                try:
+                    raw = base64.b64decode(text.split(",", 1)[1])
+                    return Image.open(io.BytesIO(raw)).convert("RGBA")
+                except Exception:
+                    return None
+            p = Path(text)
+            if p.exists() and p.is_file():
+                try:
+                    return Image.open(p).convert("RGBA")
+                except Exception:
+                    return None
+        return None
+
+    def _build_petpet_gif(self, avatar: Image.Image, interval: float) -> Path:
+        boxes = [
+            (27, 31, 86, 90),
+            (22, 36, 91, 90),
+            (18, 41, 95, 90),
+            (22, 41, 91, 91),
+            (27, 28, 86, 91),
+        ]
         frames = []
-        num_frames = 20
-        duration = 50
-        
-        for i in range(num_frames):
-            canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-            
-            phase = (i / num_frames) * 2 * math.pi
-            
-            squeeze_factor = 0.08 * math.sin(phase)
-            offset_y = 8 * math.sin(phase)
-            
-            squeeze_w = int(avatar_size * (1 + squeeze_factor))
-            squeeze_h = int(avatar_size * (1 - squeeze_factor * 0.5))
-            
-            squeezed = avatar.resize((squeeze_w, squeeze_h), Image.Resampling.LANCZOS)
-            
-            paste_x = (canvas_size - squeeze_w) // 2
-            paste_y = (canvas_size - squeeze_h) // 2 + int(offset_y)
-            
-            canvas.paste(squeezed, (paste_x, paste_y), squeezed)
-            
-            hand_frame = self._draw_hand_frame(i, num_frames, canvas_size)
-            canvas = Image.alpha_composite(canvas, hand_frame)
-            
-            frames.append(canvas.convert("RGB"))
-        
-        output = io.BytesIO()
+        for i in range(5):
+            hand = Image.open(self.assets_dir / f"frame{i}.png").convert("RGBA")
+            canvas = Image.new("RGBA", hand.size, (255, 255, 255, 0))
+            l, t, r, b = boxes[i]
+            w, h = max(1, r - l), max(1, b - t)
+            face = avatar.resize((w, h), Image.Resampling.LANCZOS)
+            canvas.paste(face, (l, t), face)
+            merged = Image.alpha_composite(canvas, hand)
+            frames.append(merged.convert("P", palette=Image.Palette.ADAPTIVE))
+
+        out_path = self.output_dir / f"petpet_{uuid.uuid4().hex}.gif"
         frames[0].save(
-            output,
-            format="GIF",
+            out_path,
             save_all=True,
             append_images=frames[1:],
-            duration=duration,
+            duration=max(20, int(interval * 1000)),
             loop=0,
+            optimize=False,
             disposal=2,
         )
-        return output.getvalue()
-    
-    def _draw_hand_frame(self, frame_idx: int, total_frames: int, size: int) -> Image.Image:
-        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(canvas)
-        
-        phase = (frame_idx / total_frames) * 2 * math.pi
-        
-        hand_color = (255, 230, 210, 230)
-        outline_color = (220, 190, 170, 255)
-        
-        center_x = size // 2
-        base_y = 30
-        
-        hand_offset_x = 10 * math.sin(phase)
-        hand_offset_y = 5 * math.sin(phase + math.pi / 4)
-        
-        palm_x = center_x + int(hand_offset_x)
-        palm_y = base_y + int(hand_offset_y)
-        
-        palm_w, palm_h = 70, 55
-        draw.ellipse(
-            [palm_x - palm_w//2, palm_y - palm_h//2,
-             palm_x + palm_w//2, palm_y + palm_h//2],
-            fill=hand_color,
-            outline=outline_color,
-            width=3
-        )
-        
-        finger_data = [
-            (-28, 25, 18, 40),
-            (-10, 30, 16, 48),
-            (8, 30, 16, 50),
-            (26, 25, 16, 45),
-            (38, 10, 14, 30),
-        ]
-        
-        for fx, fy, fw, fh in finger_data:
-            finger_x = palm_x + fx
-            finger_y = palm_y + fy
-            
-            finger_offset = 3 * math.sin(phase + fx * 0.1)
-            finger_y += int(finger_offset)
-            
-            draw.ellipse(
-                [finger_x - fw//2, finger_y,
-                 finger_x + fw//2, finger_y + fh],
-                fill=hand_color,
-                outline=outline_color,
-                width=2
-            )
-        
-        thumb_x = palm_x - 35
-        thumb_y = palm_y + 5
-        thumb_w, thumb_h = 22, 35
-        
-        draw.ellipse(
-            [thumb_x - thumb_w//2, thumb_y,
-             thumb_x + thumb_w//2, thumb_y + thumb_h],
-            fill=hand_color,
-            outline=outline_color,
-            width=2
-        )
-        
-        return canvas
-    
-    @filter.command("摸头")
-    async def touch_head_cmd(self, event: AstrMessageEvent):
-        sender_id = event.get_sender_id()
-        logger.info(f"手动触发摸头: {sender_id}")
-        
-        avatar = await self._get_qq_avatar(sender_id)
-        if avatar is None:
-            yield event.plain_result("获取头像失败，请稍后重试~")
-            return
-        
-        gif_data = self._generate_petpet_gif(avatar)
-        gif_base64 = base64.b64encode(gif_data).decode("utf-8")
-        
-        if AiocqhttpMessageEvent and isinstance(event, AiocqhttpMessageEvent):
+        return out_path
+
+    async def _cleanup_gif_loop(self):
+        while True:
             try:
-                client = event.bot
-                group_id = event.get_group_id()
-                image_data = f"base64://{gif_base64}"
-                if group_id:
-                    await client.api.call_action(
-                        "send_group_msg",
-                        group_id=group_id,
-                        message=[{"type": "image", "data": {"file": image_data}}]
-                    )
-                else:
-                    await client.api.call_action(
-                        "send_private_msg",
-                        user_id=int(sender_id),
-                        message=[{"type": "image", "data": {"file": image_data}}]
-                    )
-                logger.info(f"摸头GIF已发送给用户 {sender_id}")
-            except Exception as e:
-                logger.error(f"发送摸头GIF失败: {e}")
-                yield event.plain_result("发送失败~")
-                return
-        else:
-            yield event.plain_result("当前平台不支持发送图片~")
-            return
-        
-        yield event.plain_result("")
-    
-    @filter.platform_adapter_type("aiocqhttp")
-    async def on_aiocqhttp_event(self, event: AstrMessageEvent):
-        if AiocqhttpMessageEvent is None:
-            return
-        
-        if not isinstance(event, AiocqhttpMessageEvent):
-            return
-        
-        raw_event = getattr(event, "raw_event", None)
-        if raw_event is None:
-            return
-        
-        post_type = raw_event.get("post_type")
-        if post_type != "notice":
-            return
-        
-        notice_type = raw_event.get("notice_type")
-        if notice_type != "notify":
-            return
-        
-        sub_type = raw_event.get("sub_type")
-        if sub_type != "poke":
-            return
-        
-        target_id = raw_event.get("target_id")
-        user_id = raw_event.get("user_id")
-        group_id = raw_event.get("group_id")
-        
-        if target_id is None or user_id is None:
-            return
-        
-        bot_id = str(raw_event.get("self_id", ""))
-        if str(target_id) != bot_id:
-            return
-        
-        logger.info(f"检测到拍一拍事件: 用户 {user_id} 拍了机器人 (群: {group_id})")
-        
-        avatar = await self._get_qq_avatar(str(user_id))
-        if avatar is None:
-            logger.warning(f"获取用户 {user_id} 头像失败")
-            return
-        
-        gif_data = self._generate_petpet_gif(avatar)
-        gif_base64 = base64.b64encode(gif_data).decode("utf-8")
-        image_data = f"base64://{gif_base64}"
-        
-        try:
-            client = event.bot
-            if group_id:
-                await client.api.call_action(
-                    "send_group_msg",
-                    group_id=group_id,
-                    message=[{"type": "image", "data": {"file": image_data}}]
-                )
-            else:
-                await client.api.call_action(
-                    "send_private_msg",
-                    user_id=user_id,
-                    message=[{"type": "image", "data": {"file": image_data}}]
-                )
-            logger.info(f"摸头GIF已发送给用户 {user_id}")
-        except Exception as e:
-            logger.error(f"发送摸头GIF失败: {e}")
-    
-    async def terminate(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-        logger.info("摸头杀插件已卸载")
+                self._cleanup_old_gifs(max_age_seconds=6 * 3600)
+            except Exception:
+                logger.exception("[petpet] 定时清理失败")
+            await asyncio.sleep(3600)
+
+    def _cleanup_old_gifs(self, max_age_seconds: int):
+        now = time.time()
+        for f in self.output_dir.glob("petpet_*.gif"):
+            try:
+                if now - f.stat().st_mtime > max_age_seconds:
+                    f.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def _assets_ready(self) -> bool:
+        return all((self.assets_dir / f"frame{i}.png").exists() for i in range(5))
+
+    def _image_result(self, event: AstrMessageEvent, path: Path):
+        if hasattr(event, "make_result"):
+            result = event.make_result()
+            if hasattr(result, "image"):
+                result.image(str(path))
+                return result
+        return event.image_result(str(path))
+
+    def _get_text(self, event: AstrMessageEvent) -> str:
+        v = getattr(event, "message_str", None)
+        if isinstance(v, str):
+            return v
+        msg_obj = getattr(event, "message_obj", None)
+        v2 = getattr(msg_obj, "message_str", "")
+        return v2 if isinstance(v2, str) else ""
+
+    @staticmethod
+    def _first_attr(obj: Any, keys: tuple[str, ...]) -> Optional[Any]:
+        if obj is None:
+            return None
+        for k in keys:
+            v = getattr(obj, k, None)
+            if v is not None and v != "":
+                return v
+        return None
