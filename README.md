@@ -1,77 +1,68 @@
-# 摸头GIF生成器 (pat_head_gif)
+# touch_head - 摸头杀插件
 
-一个 AstrBot 插件，用于自动回复"摸头"并生成摸头杀GIF。
+AstrBot 摸头杀插件 - 当用户拍机器人时自动生成并发送摸头GIF动图。
 
-## 功能
+## 功能特性
 
-- 监听群聊和私聊消息中的"摸头"关键词
-- 支持 @用户 生成定向摸头GIF
-- 自动获取被@用户的QQ头像生成表情包
-- **自动安装和启动 meme-generator API 服务**
-
-## 安装
-
-将插件目录放入 AstrBot 的 `addons/plugins/` 目录下，重启 AstrBot 或在管理面板重载插件。
-
-插件会在首次加载时自动：
-1. 检测是否安装了 `meme-generator`
-2. 如未安装，自动执行 `pip install meme-generator`
-3. 启动 meme-generator API 服务
-
-## 配置
-
-在 AstrBot 管理面板中配置以下参数：
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `api_url` | meme-generator API地址 | `http://127.0.0.1:2233` |
-| `api_port` | API服务端口 | `2233` |
-| `auto_start_api` | 是否自动启动API服务 | `true` |
-
-## 使用方法
-
-发送包含"摸头"的消息并@目标用户：
-```
-摸头 @某人
-```
-
-## 工作流程
-
-```
-插件加载
-    ↓
-检测 meme-generator 是否已安装 → 未安装则自动 pip install
-    ↓
-检测 API 服务是否运行 → 未运行则自动启动
-    ↓
-用户发送: "摸头 @张三"
-    ↓
-插件提取张三的QQ号 → 获取QQ头像
-    ↓
-调用 meme-generator API → 生成摸头GIF
-    ↓
-发送表情包到群聊/私聊
-```
+- 🎯 **自动响应拍一拍**: 当用户在QQ群中"拍一拍"机器人时，自动生成并发送摸头杀GIF
+- 🖼️ **动态生成**: 使用用户QQ头像实时生成个性化摸头GIF
+- ⌨️ **手动触发**: 支持通过 `/摸头` 命令手动触发
+- ✨ **精美动画**: 20帧流畅动画，包含完整手部和挤压效果
 
 ## 依赖
 
-- httpx>=0.24.0
-- meme-generator（自动安装）
+- Pillow >= 10.0.0
+- aiohttp >= 3.8.0
 
-## 兼容性
+## 使用方法
 
-- AstrBot 版本: v3.0+
-- Python 版本: 3.10+
-- 平台: QQ（通过 NapCat 等 OneBot 实现）
+### 自动触发
+在QQ群中双击机器人头像（拍一拍），机器人会自动回复一个摸头GIF。
 
-## 注意事项
+### 手动触发
+发送命令：
+```
+/摸头
+```
 
-1. 首次使用时，插件需要下载 meme-generator 的资源文件，可能需要等待一段时间
-2. 如果自动启动失败，可以手动运行 `meme run` 命令启动 API 服务
-3. Windows 系统可能需要安装 Visual C++ 运行时
+## 平台支持
+
+- ✅ QQ (通过 NapCat / aiocqhttp 适配器)
+- ⚠️ 其他平台暂不支持拍一拍事件
+
+## 安装
+
+1. 将插件放入 AstrBot 的 `data/plugins/` 目录
+2. 重启 AstrBot 或在插件管理页面重载插件
+
+## 配置说明
+
+无需额外配置，安装后即可使用。
+
+## 技术实现
+
+- 使用 Pillow 库本地生成GIF动画
+- 通过 QQ 官方头像 API 获取用户头像
+- 监听 OneBot v11 协议的 `notice.notify.poke` 事件
+- 使用 base64 编码发送图片，兼容性更好
+
+## 更新日志
+
+### v1.1.0
+- 🎨 重构动画效果，更流畅的摸头动画
+- ✨ 新增 20 帧动画，每帧 50ms
+- 🖐️ 完整的手部绘制（包含手掌和 5 根手指）
+- 📐 更大的画布尺寸 (256x256)，更清晰的图像
+- 🔄 头像挤压效果优化，使用正弦波实现自然变形
+- 📤 改用 base64 编码发送图片，解决文件路径兼容性问题
+- 🔧 添加备用头像 URL，提高头像获取成功率
+
+### v1.0.0
+- 🎉 初始版本发布
+- ✅ 支持拍一拍事件触发
+- ✅ 支持手动命令触发
+- ✅ 基础摸头 GIF 生成
 
 ## 支持
 
-- [插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [meme-generator 项目](https://github.com/MeetWq/meme-generator)
-- [GitHub 仓库](https://github.com/mjy1113451/touch_head)
+[AstrBot 官方文档](https://astrbot.app)

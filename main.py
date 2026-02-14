@@ -1,204 +1,293 @@
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.api.message_components import Image
-from typing import Optional, List
-import httpx
-import re
-import subprocess
-import sys
+import io
+import math
 import asyncio
-import os
-import signal
+import traceback
+import base64
+from pathlib import Path
+from typing import Optional
 
-@register(
-    "pat_head_gif",
-    "mjy1113451",
-    "一个自动回复'摸头'并生成摸头杀GIF的插件",
-    "1.0.0"
-)
-class PatHeadGifPlugin(Star):
+import aiohttp
+from PIL import Image, ImageDraw, ImageSequence
+
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
+from astrbot.api.message_components import Image as ImgComp
+
+try:
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+except ImportError:
+    AiocqhttpMessageEvent = None
+
+
+@register("touch_head", "摸头杀插件", "当用户拍机器人时自动生成并发送摸头GIF动图", "1.1.0")
+class TouchHeadPlugin(Star):
+    QQ_AVATAR_URL = "https://q.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640&img_type=jpg"
+    QQ_AVATAR_URL_ALT = "https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+    
     def __init__(self, context: Context):
         super().__init__(context)
-        self.meme_api_url = self.config.get("api_url", "http://127.0.0.1:2233")
-        self.petpet_endpoint = f"{self.meme_api_url}/memes/petpet/"
-        self.auto_start = self.config.get("auto_start_api", True)
-        self.api_port = self.config.get("api_port", 2233)
-        self.api_process: Optional[subprocess.Popen] = None
-        self._api_started_by_plugin = False
-
-    async def _install_meme_generator(self) -> bool:
-        try:
-            self.logger.info("正在安装 meme-generator...")
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "meme-generator", "-q"],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            if result.returncode == 0:
-                self.logger.info("meme-generator 安装成功")
-                return True
-            else:
-                self.logger.error(f"meme-generator 安装失败: {result.stderr}")
-                return False
-        except subprocess.TimeoutExpired:
-            self.logger.error("meme-generator 安装超时")
-            return False
-        except Exception as e:
-            self.logger.error(f"meme-generator 安装异常: {e}")
-            return False
-
-    def _check_meme_generator_installed(self) -> bool:
-        try:
-            import meme_generator
-            return True
-        except ImportError:
-            return False
-
-    async def _check_api_running(self) -> bool:
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{self.meme_api_url}/memes/list",
-                    timeout=5.0
-                )
-                return response.status_code == 200
-        except:
-            return False
-
-    async def _start_api_server(self) -> bool:
-        if await self._check_api_running():
-            self.logger.info("meme-generator API 服务已在运行")
-            return True
-
-        if not self._check_meme_generator_installed():
-            self.logger.info("未检测到 meme-generator，正在自动安装...")
-            if not await self._install_meme_generator():
-                return False
-
-        try:
-            self.logger.info(f"正在启动 meme-generator API 服务 (端口: {self.api_port})...")
-            
-            self.api_process = subprocess.Popen(
-                [sys.executable, "-m", "meme_generator.app"],
-                env={**os.environ, "MEME_PORT": str(self.api_port)},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            )
-            
-            for _ in range(30):
-                await asyncio.sleep(1)
-                if await self._check_api_running():
-                    self._api_started_by_plugin = True
-                    self.logger.info("meme-generator API 服务启动成功")
-                    return True
-            
-            self.logger.error("meme-generator API 服务启动超时")
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"启动 meme-generator API 服务失败: {e}")
-            return False
-
-    def _stop_api_server(self):
-        if self.api_process and self._api_started_by_plugin:
-            try:
-                self.api_process.terminate()
-                self.api_process.wait(timeout=5)
-                self.logger.info("meme-generator API 服务已停止")
-            except subprocess.TimeoutExpired:
-                self.api_process.kill()
-                self.logger.info("meme-generator API 服务已强制停止")
-            except Exception as e:
-                self.logger.error(f"停止 API 服务时出错: {e}")
-            finally:
-                self.api_process = None
-                self._api_started_by_plugin = False
-
-    async def _init_api(self):
-        if self.auto_start:
-            success = await self._start_api_server()
-            if not success:
-                self.logger.warning("自动启动 meme-generator API 失败，请手动启动服务")
-
+        self.data_dir = Path("data/touch_head")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._session: Optional[aiohttp.ClientSession] = None
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ssl=False)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
+    
     async def initialize(self):
-        await self._init_api()
-
-    async def terminate(self):
-        self._stop_api_server()
-
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE)
-    async def on_message_received(self, event: AstrMessageEvent):
-        message_str = event.message_str
-        message_chain = event.message_obj.message
+        logger.info("摸头杀插件初始化完成")
+    
+    async def _get_qq_avatar(self, user_id: str) -> Optional[Image.Image]:
+        urls = [
+            self.QQ_AVATAR_URL.format(user_id=user_id),
+            self.QQ_AVATAR_URL_ALT.format(user_id=user_id),
+        ]
         
-        if re.search(r"摸头", message_str, re.IGNORECASE):
-            at_users = self.extract_at_users(message_chain)
+        for url in urls:
+            try:
+                session = await self._get_session()
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+                async with session.get(
+                    url, 
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    headers=headers
+                ) as resp:
+                    logger.info(f"请求头像URL: {url}, 状态码: {resp.status}")
+                    if resp.status == 200:
+                        img_data = await resp.read()
+                        if len(img_data) > 0:
+                            img = Image.open(io.BytesIO(img_data))
+                            return img.convert("RGBA")
+                        else:
+                            logger.warning(f"头像数据为空: {url}")
+            except asyncio.TimeoutError:
+                logger.error(f"获取QQ头像超时: {url}")
+            except aiohttp.ClientError as e:
+                logger.error(f"网络请求失败: {e}")
+            except Exception as e:
+                logger.error(f"获取QQ头像失败: {e}\n{traceback.format_exc()}")
+        
+        return None
+    
+    def _generate_petpet_gif(self, avatar: Image.Image) -> bytes:
+        canvas_size = 256
+        avatar_size = 180
+        avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        
+        frames = []
+        num_frames = 20
+        duration = 50
+        
+        for i in range(num_frames):
+            canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
             
-            if at_users:
-                at_user_id = at_users[0]
-                await self.generate_and_send_pat_gif(event, at_user_id)
-            else:
-                await event.send("❓ 请@一个用户来生成摸头杀GIF")
-
-    def extract_at_users(self, message_chain: List) -> List[str]:
-        at_users = []
-        for component in message_chain:
-            if hasattr(component, 'type') and component.type.name == 'At':
-                if hasattr(component, 'qq'):
-                    at_users.append(component.qq)
-                elif hasattr(component, 'user_id'):
-                    at_users.append(component.user_id)
-        return at_users
-
-    async def get_user_avatar(self, user_id: str) -> bytes:
-        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-        async with httpx.AsyncClient() as client:
-            response = await client.get(avatar_url, timeout=10.0)
-            response.raise_for_status()
-            return response.content
-
-    async def generate_and_send_pat_gif(self, event: AstrMessageEvent, at_user_id: Optional[str]):
+            phase = (i / num_frames) * 2 * math.pi
+            
+            squeeze_factor = 0.08 * math.sin(phase)
+            offset_y = 8 * math.sin(phase)
+            
+            squeeze_w = int(avatar_size * (1 + squeeze_factor))
+            squeeze_h = int(avatar_size * (1 - squeeze_factor * 0.5))
+            
+            squeezed = avatar.resize((squeeze_w, squeeze_h), Image.Resampling.LANCZOS)
+            
+            paste_x = (canvas_size - squeeze_w) // 2
+            paste_y = (canvas_size - squeeze_h) // 2 + int(offset_y)
+            
+            canvas.paste(squeezed, (paste_x, paste_y), squeezed)
+            
+            hand_frame = self._draw_hand_frame(i, num_frames, canvas_size)
+            canvas = Image.alpha_composite(canvas, hand_frame)
+            
+            frames.append(canvas.convert("RGB"))
+        
+        output = io.BytesIO()
+        frames[0].save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=duration,
+            loop=0,
+            disposal=2,
+        )
+        return output.getvalue()
+    
+    def _draw_hand_frame(self, frame_idx: int, total_frames: int, size: int) -> Image.Image:
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        
+        phase = (frame_idx / total_frames) * 2 * math.pi
+        
+        hand_color = (255, 230, 210, 230)
+        outline_color = (220, 190, 170, 255)
+        
+        center_x = size // 2
+        base_y = 30
+        
+        hand_offset_x = 10 * math.sin(phase)
+        hand_offset_y = 5 * math.sin(phase + math.pi / 4)
+        
+        palm_x = center_x + int(hand_offset_x)
+        palm_y = base_y + int(hand_offset_y)
+        
+        palm_w, palm_h = 70, 55
+        draw.ellipse(
+            [palm_x - palm_w//2, palm_y - palm_h//2,
+             palm_x + palm_w//2, palm_y + palm_h//2],
+            fill=hand_color,
+            outline=outline_color,
+            width=3
+        )
+        
+        finger_data = [
+            (-28, 25, 18, 40),
+            (-10, 30, 16, 48),
+            (8, 30, 16, 50),
+            (26, 25, 16, 45),
+            (38, 10, 14, 30),
+        ]
+        
+        for fx, fy, fw, fh in finger_data:
+            finger_x = palm_x + fx
+            finger_y = palm_y + fy
+            
+            finger_offset = 3 * math.sin(phase + fx * 0.1)
+            finger_y += int(finger_offset)
+            
+            draw.ellipse(
+                [finger_x - fw//2, finger_y,
+                 finger_x + fw//2, finger_y + fh],
+                fill=hand_color,
+                outline=outline_color,
+                width=2
+            )
+        
+        thumb_x = palm_x - 35
+        thumb_y = palm_y + 5
+        thumb_w, thumb_h = 22, 35
+        
+        draw.ellipse(
+            [thumb_x - thumb_w//2, thumb_y,
+             thumb_x + thumb_w//2, thumb_y + thumb_h],
+            fill=hand_color,
+            outline=outline_color,
+            width=2
+        )
+        
+        return canvas
+    
+    @filter.command("摸头")
+    async def touch_head_cmd(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        logger.info(f"手动触发摸头: {sender_id}")
+        
+        avatar = await self._get_qq_avatar(sender_id)
+        if avatar is None:
+            yield event.plain_result("获取头像失败，请稍后重试~")
+            return
+        
+        gif_data = self._generate_petpet_gif(avatar)
+        gif_base64 = base64.b64encode(gif_data).decode("utf-8")
+        
+        if AiocqhttpMessageEvent and isinstance(event, AiocqhttpMessageEvent):
+            try:
+                client = event.bot
+                group_id = event.get_group_id()
+                image_data = f"base64://{gif_base64}"
+                if group_id:
+                    await client.api.call_action(
+                        "send_group_msg",
+                        group_id=group_id,
+                        message=[{"type": "image", "data": {"file": image_data}}]
+                    )
+                else:
+                    await client.api.call_action(
+                        "send_private_msg",
+                        user_id=int(sender_id),
+                        message=[{"type": "image", "data": {"file": image_data}}]
+                    )
+                logger.info(f"摸头GIF已发送给用户 {sender_id}")
+            except Exception as e:
+                logger.error(f"发送摸头GIF失败: {e}")
+                yield event.plain_result("发送失败~")
+                return
+        else:
+            yield event.plain_result("当前平台不支持发送图片~")
+            return
+        
+        yield event.plain_result("")
+    
+    @filter.platform_adapter_type("aiocqhttp")
+    async def on_aiocqhttp_event(self, event: AstrMessageEvent):
+        if AiocqhttpMessageEvent is None:
+            return
+        
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return
+        
+        raw_event = getattr(event, "raw_event", None)
+        if raw_event is None:
+            return
+        
+        post_type = raw_event.get("post_type")
+        if post_type != "notice":
+            return
+        
+        notice_type = raw_event.get("notice_type")
+        if notice_type != "notify":
+            return
+        
+        sub_type = raw_event.get("sub_type")
+        if sub_type != "poke":
+            return
+        
+        target_id = raw_event.get("target_id")
+        user_id = raw_event.get("user_id")
+        group_id = raw_event.get("group_id")
+        
+        if target_id is None or user_id is None:
+            return
+        
+        bot_id = str(raw_event.get("self_id", ""))
+        if str(target_id) != bot_id:
+            return
+        
+        logger.info(f"检测到拍一拍事件: 用户 {user_id} 拍了机器人 (群: {group_id})")
+        
+        avatar = await self._get_qq_avatar(str(user_id))
+        if avatar is None:
+            logger.warning(f"获取用户 {user_id} 头像失败")
+            return
+        
+        gif_data = self._generate_petpet_gif(avatar)
+        gif_base64 = base64.b64encode(gif_data).decode("utf-8")
+        image_data = f"base64://{gif_base64}"
+        
         try:
-            if not at_user_id:
-                await event.send("❌ 请@一个有效的用户")
-                return
-            
-            if not await self._check_api_running():
-                await event.send("❌ meme-generator API 服务未运行，请检查配置或手动启动")
-                return
-            
-            avatar_data = await self.get_user_avatar(at_user_id)
-            
-            files = [("images", ("avatar.jpg", avatar_data, "image/jpeg"))]
-            data = {"texts": "[]", "args": "{}"}
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    self.petpet_endpoint,
-                    files=files,
-                    data=data,
-                    timeout=30.0
+            client = event.bot
+            if group_id:
+                await client.api.call_action(
+                    "send_group_msg",
+                    group_id=group_id,
+                    message=[{"type": "image", "data": {"file": image_data}}]
                 )
-                response.raise_for_status()
-                
-                gif_data = response.content
-                
-                await event.send(
-                    Image(file=gif_data),
-                    message="✨ 摸头杀GIF已生成！"
+            else:
+                await client.api.call_action(
+                    "send_private_msg",
+                    user_id=user_id,
+                    message=[{"type": "image", "data": {"file": image_data}}]
                 )
-                
-        except httpx.ConnectError:
-            await event.send("❌ 无法连接到 meme-generator API，请确认服务已启动")
-            self.logger.error("无法连接到 meme-generator API")
-        except httpx.RequestError as e:
-            await event.send("❌ 生成GIF时网络错误，请稍后重试")
-            self.logger.error(f"GIF生成失败: 网络错误 - {e}")
-        except httpx.HTTPStatusError as e:
-            await event.send("❌ 生成GIF时服务错误，请联系管理员")
-            self.logger.error(f"GIF生成失败: HTTP状态错误 - {e}")
+            logger.info(f"摸头GIF已发送给用户 {user_id}")
         except Exception as e:
-            await event.send("❌ 生成GIF时发生未知错误")
-            self.logger.error(f"GIF生成失败: 未知错误 - {e}")
+            logger.error(f"发送摸头GIF失败: {e}")
+    
+    async def terminate(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+        logger.info("摸头杀插件已卸载")
