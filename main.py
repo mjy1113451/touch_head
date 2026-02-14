@@ -1,95 +1,198 @@
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import Image
 from typing import Optional, List
 import httpx
 import re
+import subprocess
+import sys
+import asyncio
+import os
+import signal
 
 @register(
     "pat_head_gif",
-    "YourName",
+    "mjy1113451",
     "一个自动回复'摸头'并生成摸头杀GIF的插件",
     "1.0.0"
 )
 class PatHeadGifPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        # 初始化时可以配置一些参数，例如API密钥或默认模板
-        self.gif_api_url = "https://api.example.com/pat-head"  # 替换为实际的GIF生成API
-        self.api_key = "your_api_key"  # 如果API需要认证
-        self.headers = {
-            "User-Agent": "AstrBot-PatHeadGif/1.0",
-            "Authorization": f"Bearer {self.api_key}"
-        }
+        self.meme_api_url = self.config.get("api_url", "http://127.0.0.1:2233")
+        self.petpet_endpoint = f"{self.meme_api_url}/memes/petpet/"
+        self.auto_start = self.config.get("auto_start_api", True)
+        self.api_port = self.config.get("api_port", 2233)
+        self.api_process: Optional[subprocess.Popen] = None
+        self._api_started_by_plugin = False
+
+    async def _install_meme_generator(self) -> bool:
+        try:
+            self.logger.info("正在安装 meme-generator...")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "meme-generator", "-q"],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            if result.returncode == 0:
+                self.logger.info("meme-generator 安装成功")
+                return True
+            else:
+                self.logger.error(f"meme-generator 安装失败: {result.stderr}")
+                return False
+        except subprocess.TimeoutExpired:
+            self.logger.error("meme-generator 安装超时")
+            return False
+        except Exception as e:
+            self.logger.error(f"meme-generator 安装异常: {e}")
+            return False
+
+    def _check_meme_generator_installed(self) -> bool:
+        try:
+            import meme_generator
+            return True
+        except ImportError:
+            return False
+
+    async def _check_api_running(self) -> bool:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.meme_api_url}/memes/list",
+                    timeout=5.0
+                )
+                return response.status_code == 200
+        except:
+            return False
+
+    async def _start_api_server(self) -> bool:
+        if await self._check_api_running():
+            self.logger.info("meme-generator API 服务已在运行")
+            return True
+
+        if not self._check_meme_generator_installed():
+            self.logger.info("未检测到 meme-generator，正在自动安装...")
+            if not await self._install_meme_generator():
+                return False
+
+        try:
+            self.logger.info(f"正在启动 meme-generator API 服务 (端口: {self.api_port})...")
+            
+            self.api_process = subprocess.Popen(
+                [sys.executable, "-m", "meme_generator.app"],
+                env={**os.environ, "MEME_PORT": str(self.api_port)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if await self._check_api_running():
+                    self._api_started_by_plugin = True
+                    self.logger.info("meme-generator API 服务启动成功")
+                    return True
+            
+            self.logger.error("meme-generator API 服务启动超时")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"启动 meme-generator API 服务失败: {e}")
+            return False
+
+    def _stop_api_server(self):
+        if self.api_process and self._api_started_by_plugin:
+            try:
+                self.api_process.terminate()
+                self.api_process.wait(timeout=5)
+                self.logger.info("meme-generator API 服务已停止")
+            except subprocess.TimeoutExpired:
+                self.api_process.kill()
+                self.logger.info("meme-generator API 服务已强制停止")
+            except Exception as e:
+                self.logger.error(f"停止 API 服务时出错: {e}")
+            finally:
+                self.api_process = None
+                self._api_started_by_plugin = False
+
+    async def _init_api(self):
+        if self.auto_start:
+            success = await self._start_api_server()
+            if not success:
+                self.logger.warning("自动启动 meme-generator API 失败，请手动启动服务")
+
+    async def initialize(self):
+        await self._init_api()
+
+    async def terminate(self):
+        self._stop_api_server()
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_message_received(self, event: AstrMessageEvent):
-        """
-        监听所有消息，检查是否包含'摸头'并@用户
-        """
-        message_str = event.message_str  # 获取消息的纯文本内容<span data-allow-html class='source-item source-aggregated' data-group-key='source-group-5' data-url='https://docs.astrbot.app/dev/star/guides/listen-message-event.html' data-id='turn0fetch0'><span data-allow-html class='source-item-num' data-group-key='source-group-5' data-id='turn0fetch0'><span class='source-item-num-name' data-allow-html>astrbot.app/dev/star/guides/listen-message-event.html</span></span></span>
-        message_chain = event.message_obj.message  # 获取完整的消息链<span data-allow-html class='source-item source-aggregated' data-group-key='source-group-6' data-url='https://docs.astrbot.app/dev/star/guides/listen-message-event.html' data-id='turn0fetch0'><span data-allow-html class='source-item-num' data-group-key='source-group-6' data-id='turn0fetch0'><span class='source-item-num-name' data-allow-html>astrbot.app/dev/star/guides/listen-message-event.html</span></span></span>
+        message_str = event.message_str
+        message_chain = event.message_obj.message
         
-        # 检查是否包含'摸头'关键词（不区分大小写）
         if re.search(r"摸头", message_str, re.IGNORECASE):
-            # 提取消息链中的@信息（如果存在）
             at_users = self.extract_at_users(message_chain)
             
             if at_users:
-                # 找到被@的用户，生成并发送摸头GIF
-                at_user_id = at_users[0]  # 取第一个被@的用户
+                at_user_id = at_users[0]
                 await self.generate_and_send_pat_gif(event, at_user_id)
             else:
-                # 消息包含'摸头'但未@任何用户，可以提示用户或回复通用摸头GIF
-                await event.send("❓ 请@一个用户来生成摸头杀GIF，或直接发送'摸头'获取通用摸头GIF")
-                # 这里也可以选择发送一个通用的摸头GIF
-                await self.generate_and_send_pat_gif(event, None)
+                await event.send("❓ 请@一个用户来生成摸头杀GIF")
 
     def extract_at_users(self, message_chain: List) -> List[str]:
-        """
-        从消息链中提取被@的用户ID列表
-        """
         at_users = []
         for component in message_chain:
-            # 检查消息段类型是否为At（提及）
             if hasattr(component, 'type') and component.type.name == 'At':
-                at_users.append(component.qq)  # 获取被@用户的QQ号
+                if hasattr(component, 'qq'):
+                    at_users.append(component.qq)
+                elif hasattr(component, 'user_id'):
+                    at_users.append(component.user_id)
         return at_users
 
+    async def get_user_avatar(self, user_id: str) -> bytes:
+        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(avatar_url, timeout=10.0)
+            response.raise_for_status()
+            return response.content
+
     async def generate_and_send_pat_gif(self, event: AstrMessageEvent, at_user_id: Optional[str]):
-        """
-        生成摸头GIF并通过event对象发送
-        """
         try:
-            # 准备API请求参数
-            params = {
-                "text": "摸摸头~",  # GIF上的文字
-                "template": "pat_head",  # 使用的模板ID或名称
-            }
-            if at_user_id:
-                # 如果有@用户，可以尝试获取其昵称或头像，这里简化处理
-                params["target_user"] = at_user_id
+            if not at_user_id:
+                await event.send("❌ 请@一个有效的用户")
+                return
             
-            # 异步调用外部API生成GIF（使用httpx库）
+            if not await self._check_api_running():
+                await event.send("❌ meme-generator API 服务未运行，请检查配置或手动启动")
+                return
+            
+            avatar_data = await self.get_user_avatar(at_user_id)
+            
+            files = [("images", ("avatar.jpg", avatar_data, "image/jpeg"))]
+            data = {"texts": "[]", "args": "{}"}
+            
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    self.gif_api_url,
-                    params=params,
-                    headers=self.headers,
-                    timeout=10.0
+                response = await client.post(
+                    self.petpet_endpoint,
+                    files=files,
+                    data=data,
+                    timeout=30.0
                 )
-                response.raise_for_status()  # 检查请求是否成功
+                response.raise_for_status()
                 
-                # 假设API返回的是GIF图片的二进制数据
                 gif_data = response.content
                 
-                # 使用AstrBot的消息发送方法发送图片<span data-allow-html class='source-item source-aggregated' data-group-key='source-group-7' data-url='https://docs.astrbot.app/dev/star/guides/listen-message-event.html' data-id='turn0fetch0'><span data-allow-html class='source-item-num' data-group-key='source-group-7' data-id='turn0fetch0'><span class='source-item-num-name' data-allow-html>astrbot.app/dev/star/guides/listen-message-event.html</span></span></span>
-                # 注意：这里需要根据AstrBot的发送图片API进行调整
-                # 可能需要将图片上传到图床或直接发送二进制数据
                 await event.send(
-                    message=f"✨ 摸头杀GIF已生成！",
-                    image=gif_data  # 假设event.send()支持image参数接收二进制数据
+                    Image(file=gif_data),
+                    message="✨ 摸头杀GIF已生成！"
                 )
                 
+        except httpx.ConnectError:
+            await event.send("❌ 无法连接到 meme-generator API，请确认服务已启动")
+            self.logger.error("无法连接到 meme-generator API")
         except httpx.RequestError as e:
             await event.send("❌ 生成GIF时网络错误，请稍后重试")
             self.logger.error(f"GIF生成失败: 网络错误 - {e}")
