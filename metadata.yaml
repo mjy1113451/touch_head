@@ -1,5 +1,5 @@
 name: touch_head
-desc: 摸头杀插件 - 当用户拍机器人时自动生成并发送摸头GIF动图
+desc: 摸头杀GIF插件
 version: v1.1.0
 author: mjy1113451
 repo: https://github.com/mjy1113451/touch_head
