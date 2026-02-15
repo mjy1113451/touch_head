@@ -1,1 +1,22 @@
-.trae
+# Python virtual env
+.venv/
+venv/
+
+# AstrBot runtime files
+.astrbot
+astrbot.lock
+data/
+
+# Archives and temp
+*.zip
+*.log
+__pycache__/
+*.pyc
+
+# Keep plugin source and assets
+!astrbot_plugin_petpet/
+!astrbot_plugin_petpet/**
+
+# Exclude generated/demo artifacts in plugin assets
+astrbot_plugin_petpet/data/petpet.zip
+astrbot_plugin_petpet/data/petpet/*.gif
