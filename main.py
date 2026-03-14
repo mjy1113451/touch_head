@@ -281,16 +281,31 @@ class PetPetPlugin(Star):
 
     def _build_petpet_gif(self, avatar: Image.Image, interval: float) -> Path:
         canvas_size = (112, 112)
-        avatar_size = 65
+        avatar_size = 75
         avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        
+        squeeze_data = [
+            (1.0, 1.0, 0, 0),
+            (1.0, 0.9, 0, 3),
+            (0.95, 0.85, 2, 5),
+            (1.0, 0.9, 0, 3),
+            (1.0, 1.0, 0, 0),
+        ]
         
         frames = []
         for i in range(5):
             hand = Image.open(self.assets_dir / f"frame{i}.png").convert("RGBA")
             canvas = Image.new("RGBA", canvas_size, (255, 255, 255, 0))
             
-            offset = (canvas_size[0] - avatar_size) // 2
-            canvas.paste(avatar, (offset, offset))
+            sx, sy, ox, oy = squeeze_data[i]
+            w = int(avatar_size * sx)
+            h = int(avatar_size * sy)
+            squeezed = avatar.resize((w, h), Image.Resampling.LANCZOS)
+            
+            x = (canvas_size[0] - w) // 2 + ox
+            y = (canvas_size[1] - h) // 2 + oy
+            
+            canvas.paste(squeezed, (x, y))
             canvas = Image.alpha_composite(canvas, hand)
             
             frames.append(canvas.convert("P", palette=Image.Palette.ADAPTIVE))
