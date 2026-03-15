@@ -19,7 +19,7 @@ from astrbot.api.star import Context, Star, register
 
 DEFAULT_CONFIG = {
     "trigger": "摸摸",
-    "interval": 0.06,
+    "interval": 0.04,
 }
 
 QQ_AVATAR_URLS = [
