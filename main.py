@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import logging
 import re
 import time
 from io import BytesIO
@@ -14,6 +13,9 @@ from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import Image as AstrImage
 from astrbot.api.star import StarTools
+
+# 设置Pillow图像像素上限，防止解压炸弹
+Image.MAX_IMAGE_PIXELS = 10_000_000
 
 
 class TouchHeadPlugin(star.Star):
@@ -38,7 +40,7 @@ class TouchHeadPlugin(star.Star):
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_terminating = False  # 用于优雅关闭
 
-        # 4. 复用aiohttp session
+        # 4. 初始化aiohttp session（复用）
         self._session: Optional[aiohttp.ClientSession] = None
 
         logger.info("摸头杀插件初始化完成。")
@@ -115,33 +117,36 @@ class TouchHeadPlugin(star.Star):
             logger.info("从事件Base64获取头像。")
             try:
                 image_data = base64.b64decode(avatar_base64)
+                # 安全验证：大小限制
                 if len(image_data) > 5 * 1024 * 1024:
                     logger.warning("Base64头像过大，超过5MB限制")
                     return None
+                # 安全验证：使用Pillow验证并检查像素
                 img = Image.open(BytesIO(image_data))
-                img.verify()
-                img = Image.open(BytesIO(image_data))
-                if img.width * img.height > 2000 * 2000:
-                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                img.verify()  # 验证图片完整性
+                img = Image.open(BytesIO(image_data))  # verify()后需重新打开
+                # 检查像素上限
+                if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+                    logger.warning(f"Base64头像像素过大: {img.width}x{img.height}")
+                    return None
                 return img
             except Exception as e:
                 logger.error(f"解析Base64头像失败: {e}")
 
         # 尝试通过框架API获取（这是更标准的方式）
         try:
-            # 假设框架提供了获取头像的方法，需根据实际API调整
-            # 例如: avatar_bytes = await event.context.get_user_avatar(event.sender.user_id)
-            # 以下为示意代码
             avatar_bytes = await self._get_avatar_via_framework(event)
             if avatar_bytes:
+                # 同样进行安全验证
                 if len(avatar_bytes) > 5 * 1024 * 1024:
                     logger.warning("框架头像过大，超过5MB限制")
                     return None
                 img = Image.open(BytesIO(avatar_bytes))
                 img.verify()
                 img = Image.open(BytesIO(avatar_bytes))
-                if img.width * img.height > 2000 * 2000:
-                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+                    logger.warning(f"框架头像像素过大: {img.width}x{img.height}")
+                    return None
                 return img
         except AttributeError:
             logger.debug("框架未提供标准头像获取方法。")
@@ -161,44 +166,48 @@ class TouchHeadPlugin(star.Star):
         return None
 
     async def _download_image(self, url: str) -> Optional[Image.Image]:
-        """ 安全下载网络图片。 增加Content-Type、大小限制，防止恶意文件导致内存或安全问题。 """
+        """安全下载网络图片，使用流式读取防止内存放大。"""
         try:
+            # 复用session
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession()
+
             async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status != 200:
-                        logger.error(f"下载图片失败，HTTP状态码: {response.status}")
-                        return None
+                if response.status != 200:
+                    logger.error(f"下载图片失败，HTTP状态码: {response.status}")
+                    return None
 
-                    # 1. 检查Content-Type
-                    content_type = response.headers.get("Content-Type", "")
-                    if "image" not in content_type:
-                        logger.warning(f"非图片Content-Type: {content_type}")
-                        return None
+                # 1. 检查Content-Type
+                content_type = response.headers.get("Content-Type", "")
+                if "image" not in content_type:
+                    logger.warning(f"非图片Content-Type: {content_type}")
+                    return None
 
-                    # 2. 限制下载数据大小 (例如：5MB)
-                    max_size = 5 * 1024 * 1024  # 5MB
-                    if response.content_length and response.content_length > max_size:
-                        logger.warning(f"图片过大，超过限制: {response.content_length} bytes")
-                        return None
+                # 2. 限制下载数据大小 (5MB)
+                max_size = 5 * 1024 * 1024
+                if response.content_length and response.content_length > max_size:
+                    logger.warning(f"图片过大，超过限制: {response.content_length} bytes")
+                    return None
 
-                    image_data = await response.read()
+                # 3. 流式读取，边读边检查大小
+                image_data = b""
+                async for chunk in response.content.iter_chunked(8192):
+                    image_data += chunk
                     if len(image_data) > max_size:
-                        logger.warning(f"实际下载图片过大，已截断")
+                        logger.warning("下载图片超过大小限制，已中止")
                         return None
 
-                    # 3. 验证并打开图片
-                    img = Image.open(BytesIO(image_data))
-                    img.verify()  # 验证图片完整性
-                    img = Image.open(BytesIO(image_data))  # 重新打开，因为verify()会关闭文件
-                    
-                    # 4. 可选：限制图片像素尺寸，防止内存压力
-                    max_pixels = 2000 * 2000
-                    if img.width * img.height > max_pixels:
-                        logger.warning(f"图片像素过大，将进行缩放。")
-                        img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
-                    
-                    return img
+                # 4. 验证并打开图片
+                img = Image.open(BytesIO(image_data))
+                img.verify()
+                img = Image.open(BytesIO(image_data))
+
+                # 5. 检查像素尺寸
+                if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+                    logger.warning(f"图片像素过大: {img.width}x{img.height}")
+                    return None
+
+                return img
 
         except asyncio.TimeoutError:
             logger.error("下载图片超时。")
@@ -218,8 +227,9 @@ class TouchHeadPlugin(star.Star):
 
         # 1. 准备输出文件路径 - 清洗用户名防止路径注入
         timestamp = int(time.time() * 1000)
-        safe_username = re.sub(r'[/\\<>:"\'|?*\x00-\x1f]', '_', username)
-        safe_username = safe_username[:50]  # 限制长度
+        # 清洗用户名：移除危险字符，限制长度
+        safe_username = re.sub(r'[/\\<>:"|?*\x00-\x1f]', '_', username)
+        safe_username = safe_username[:50]  # 限制长度50字符
         output_filename = f"petpet_{safe_username}_{timestamp}.gif"
         output_path = self.output_dir / output_filename
 
