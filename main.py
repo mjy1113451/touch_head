@@ -1,36 +1,30 @@
 import asyncio
 import base64
 import logging
-import os
+import re
+import time
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 from PIL import Image
 import aiohttp
 
 from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
-from astrbot.api.message_components import Image as AstrImage, Plain
-
-# 初始化日志记录器
-logger = logging.getLogger("astrbot_plugin_touch_head")
+from astrbot.api.message_components import Image as AstrImage
+from astrbot.api.star import StarTools
 
 
 class TouchHeadPlugin(star.Star):
-    """
-    摸头杀插件主类。
-    严格遵循AstrBot生命周期，使用线程池处理CPU密集型任务，
-    确保异步事件循环不被阻塞。
-    """
+    """ 摸头杀插件主类。 严格遵循AstrBot生命周期，使用线程池处理CPU密集型任务， 确保异步事件循环不被阻塞。 """
 
     def __init__(self, context: star.Context):
         super().__init__(context)
         logger.info("摸头杀插件正在初始化...")
 
         # 1. 使用规范的数据持久化目录
-        # 使用框架提供的方法，确保在只读/容器环境下可写
-        self.data_dir = Path(context.get_data_dir())
+        self.data_dir = Path(StarTools.get_data_dir())
         self.output_dir = self.data_dir / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -44,21 +38,18 @@ class TouchHeadPlugin(star.Star):
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_terminating = False  # 用于优雅关闭
 
+        # 4. 复用aiohttp session
+        self._session: Optional[aiohttp.ClientSession] = None
+
         logger.info("摸头杀插件初始化完成。")
 
     async def on_astrbot_loaded(self):
-        """
-        插件加载完成后的生命周期钩子。
-        启动后台清理任务，并正确管理其生命周期。
-        """
+        """ 插件加载完成后的生命周期钩子。 启动后台清理任务，并正确管理其生命周期。 """
         logger.info("摸头杀插件已加载，启动后台清理任务...")
         self._cleanup_task = asyncio.create_task(self._cleanup_old_gifs())
 
     async def terminate(self):
-        """
-        插件卸载/停止时的生命周期钩子。
-        取消后台任务，确保资源释放，避免任务泄漏。
-        """
+        """ 插件卸载/停止时的生命周期钩子。 取消后台任务，确保资源释放，避免任务泄漏。 """
         logger.info("摸头杀插件正在终止...")
         self._is_terminating = True
 
@@ -72,17 +63,18 @@ class TouchHeadPlugin(star.Star):
             except Exception as e:
                 logger.error(f"取消清理任务时出错: {e}")
 
+        # 关闭aiohttp session
+        if self._session and not self._session.closed:
+            await self._session.close()
+            logger.info("aiohttp session已关闭。")
+
         logger.info("摸头杀插件已终止。")
 
     # --- 核心功能实现 ---
 
-    @filter.command("摸头杀")
+@filter.command("摸头杀")
     async def handle_command(self, event: AstrMessageEvent):
-        """
-        处理“摸头杀”命令。
-        1. 异步获取头像（支持多种来源）。
-        2. 将CPU密集型GIF生成任务卸载到线程池，避免阻塞事件循环。
-        """
+        """ 处理“摸头杀”命令。 1. 异步获取头像（支持多种来源）。 2. 将CPU密集型GIF生成任务卸载到线程池，避免阻塞事件循环。 """
         sender_name = event.message_event_obj.sender.nickname
         logger.info(f"收到来自 {sender_name} 的摸头杀命令。")
 
@@ -111,13 +103,7 @@ class TouchHeadPlugin(star.Star):
             await event.send_message("发生内部错误，无法处理您的请求。")
 
     async def _get_user_avatar(self, event: AstrMessageEvent) -> Optional[Image.Image]:
-        """
-        获取用户头像，兼容多种来源：
-        1. 事件上下文中的头像URL（常见形式）。
-        2. 事件上下文中的头像Base64数据。
-        3. 通过框架API获取。
-        4. 作为fallback尝试下载QQ头像。
-        """
+        """ 获取用户头像，兼容多种来源： 1. 事件上下文中的头像URL（常见形式）。 2. 事件上下文中的头像Base64数据。 3. 通过框架API获取。 4. 作为fallback尝试下载QQ头像。 """
         # 尝试从事件上下文获取（框架不同字段名可能不同，需适配）
         avatar_url = getattr(event.message_event_obj.sender, "avatar", None)
         avatar_base64 = getattr(event.message_event_obj.sender, "avatar_base64", None)
@@ -129,7 +115,15 @@ class TouchHeadPlugin(star.Star):
             logger.info("从事件Base64获取头像。")
             try:
                 image_data = base64.b64decode(avatar_base64)
-                return Image.open(BytesIO(image_data))
+                if len(image_data) > 5 * 1024 * 1024:
+                    logger.warning("Base64头像过大，超过5MB限制")
+                    return None
+                img = Image.open(BytesIO(image_data))
+                img.verify()
+                img = Image.open(BytesIO(image_data))
+                if img.width * img.height > 2000 * 2000:
+                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                return img
             except Exception as e:
                 logger.error(f"解析Base64头像失败: {e}")
 
@@ -140,7 +134,15 @@ class TouchHeadPlugin(star.Star):
             # 以下为示意代码
             avatar_bytes = await self._get_avatar_via_framework(event)
             if avatar_bytes:
-                return Image.open(BytesIO(avatar_bytes))
+                if len(avatar_bytes) > 5 * 1024 * 1024:
+                    logger.warning("框架头像过大，超过5MB限制")
+                    return None
+                img = Image.open(BytesIO(avatar_bytes))
+                img.verify()
+                img = Image.open(BytesIO(avatar_bytes))
+                if img.width * img.height > 2000 * 2000:
+                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                return img
         except AttributeError:
             logger.debug("框架未提供标准头像获取方法。")
         except Exception as e:
@@ -159,13 +161,11 @@ class TouchHeadPlugin(star.Star):
         return None
 
     async def _download_image(self, url: str) -> Optional[Image.Image]:
-        """
-        安全下载网络图片。
-        增加Content-Type、大小限制，防止恶意文件导致内存或安全问题。
-        """
+        """ 安全下载网络图片。 增加Content-Type、大小限制，防止恶意文件导致内存或安全问题。 """
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status != 200:
                         logger.error(f"下载图片失败，HTTP状态码: {response.status}")
                         return None
@@ -210,20 +210,17 @@ class TouchHeadPlugin(star.Star):
         return None
 
     def _build_petpet_gif(self, user_image: Image.Image, username: str) -> Optional[Path]:
-        """
-        CPU密集型：生成摸头杀GIF。
-        此函数在单独的线程中运行，不会阻塞事件循环。
-        使用 `with` 语句确保资源句柄释放。
-        """
+        """ CPU密集型：生成摸头杀GIF。 此函数在单独的线程中运行，不会阻塞事件循环。 使用 `with` 语句确保资源句柄释放。 """
         if self._is_terminating:
             return None
 
         logger.info(f"开始为用户 {username} 生成GIF...")
-        
-        # 1. 准备输出文件路径
-        import time
+
+        # 1. 准备输出文件路径 - 清洗用户名防止路径注入
         timestamp = int(time.time() * 1000)
-        output_filename = f"petpet_{username}_{timestamp}.gif"
+        safe_username = re.sub(r'[/\\<>:"\'|?*\x00-\x1f]', '_', username)
+        safe_username = safe_username[:50]  # 限制长度
+        output_filename = f"petpet_{safe_username}_{timestamp}.gif"
         output_path = self.output_dir / output_filename
 
         try:
@@ -278,10 +275,7 @@ class TouchHeadPlugin(star.Star):
             return None
 
     async def _cleanup_old_gifs(self):
-        """
-        后台任务：定期清理旧的GIF文件，防止磁盘空间无限增长。
-        设置为每小时运行一次。
-        """
+        """ 后台任务：定期清理旧的GIF文件，防止磁盘空间无限增长。 设置为每小时运行一次。 """
         while not self._is_terminating:
             try:
                 await asyncio.sleep(3600)  # 每小时运行一次
@@ -311,14 +305,11 @@ class TouchHeadPlugin(star.Star):
 
     # 以下为辅助方法示例，需根据实际框架API补充
     async def _get_avatar_via_framework(self, event: AstrMessageEvent) -> Optional[bytes]:
-        """
-        通过AstrBot框架提供的API获取用户头像。
-        这是一个占位方法，实际实现需要根据您使用的AstrBot版本和API文档进行调整。
-        """
+        """ 通过AstrBot框架提供的API获取用户头像。 这是一个占位方法，实际实现需要根据您使用的AstrBot版本和API文档进行调整。 """
         try:
             # 示例：假设框架在上下文中提供了用户头像获取方法
             # if hasattr(self.context, 'get_user_avatar'):
-            #     return await self.context.get_user_avatar(event.sender.user_id)
+            # return await self.context.get_user_avatar(event.sender.user_id)
             # 请替换为实际的框架API调用
             logger.debug("_get_avatar_via_framework: 需根据实际框架API实现。")
             return None
