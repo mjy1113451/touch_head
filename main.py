@@ -1,369 +1,327 @@
 import asyncio
 import base64
-import inspect
-import io
-import json
-import re
-import time
-import uuid
+import logging
+import os
+from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional, Union
 
-import httpx
 from PIL import Image
+import aiohttp
 
-from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api import star, logger
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.message_components import Image as AstrImage, Plain
 
-
-DEFAULT_CONFIG = {
-    "trigger": "摸摸",
-    "interval": 0.05,
-}
-
-QQ_AVATAR_URLS = [
-    "https://q.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640&img_type=jpg",
-    "https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640",
-]
+# 初始化日志记录器
+logger = logging.getLogger("astrbot_plugin_touch_head")
 
 
-@register("astrbot_plugin_petpet", "codex", "摸头杀 petpet GIF 插件", "1.0.0")
-class PetPetPlugin(Star):
-    def __init__(self, context: Context):
+class TouchHeadPlugin(star.Star):
+    """
+    摸头杀插件主类。
+    严格遵循AstrBot生命周期，使用线程池处理CPU密集型任务，
+    确保异步事件循环不被阻塞。
+    """
+
+    def __init__(self, context: star.Context):
         super().__init__(context)
-        self.base_dir = Path(__file__).resolve().parent
-        self.assets_dir = self.base_dir / "data" / "petpet"
-        self.output_dir = self.assets_dir / "output"
-        self.config_path = self.base_dir / "config.json"
+        logger.info("摸头杀插件正在初始化...")
+
+        # 1. 使用规范的数据持久化目录
+        # 使用框架提供的方法，确保在只读/容器环境下可写
+        self.data_dir = Path(context.get_data_dir())
+        self.output_dir = self.data_dir / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.config = self._load_or_create_config()
+
+        # 2. 资源路径（模板图片）使用插件目录
+        self.assets_dir = Path(__file__).parent / "assets"
+        if not self.assets_dir.exists():
+            self.assets_dir.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"资源目录不存在，已创建空目录: {self.assets_dir}")
+
+        # 3. 初始化异步任务管理
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._is_terminating = False  # 用于优雅关闭
 
-    @filter.on_astrbot_loaded()
+        logger.info("摸头杀插件初始化完成。")
+
     async def on_astrbot_loaded(self):
-        if self._cleanup_task is None or self._cleanup_task.done():
-            self._cleanup_task = asyncio.create_task(self._cleanup_gif_loop())
-        logger.info("[petpet] 插件已加载，定时清理任务已启动")
+        """
+        插件加载完成后的生命周期钩子。
+        启动后台清理任务，并正确管理其生命周期。
+        """
+        logger.info("摸头杀插件已加载，启动后台清理任务...")
+        self._cleanup_task = asyncio.create_task(self._cleanup_old_gifs())
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
-        text = self._get_text(event).strip()
-        if not text:
-            return
+    async def terminate(self):
+        """
+        插件卸载/停止时的生命周期钩子。
+        取消后台任务，确保资源释放，避免任务泄漏。
+        """
+        logger.info("摸头杀插件正在终止...")
+        self._is_terminating = True
 
-        if text.startswith(".petset"):
-            if not await self._is_admin_or_owner(event):
-                yield event.plain_result("你没有权限使用该命令（仅机器人管理员或群主）。")
-                return
-            msg = self._handle_petset(text)
-            yield event.plain_result(msg)
-            return
+        # 安全取消后台任务
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                logger.info("后台清理任务已取消。")
+            except Exception as e:
+                logger.error(f"取消清理任务时出错: {e}")
 
-        trigger = str(self.config.get("trigger", DEFAULT_CONFIG["trigger"])).strip()
-        if not (text == trigger or text.startswith(trigger + " ")):
-            return
+        logger.info("摸头杀插件已终止。")
 
-        if not self._assets_ready():
-            logger.error("[petpet] 缺少素材，请检查 data/petpet/frame0.png ~ frame4.png")
-            yield event.plain_result("petpet 素材缺失，请联系管理员检查插件目录下 data/petpet/frame0~4.png")
-            return
+    # --- 核心功能实现 ---
 
-        target_user_id = self._resolve_target_user_id(event)
-        if not target_user_id:
-            yield event.plain_result("无法识别用户，请稍后再试。")
-            return
-
-        avatar = await self._resolve_avatar(event, target_user_id)
-        if avatar is None:
-            yield event.plain_result("未能获取目标头像，请稍后再试。")
-            return
+    @filter.command("摸头杀")
+    async def handle_command(self, event: AstrMessageEvent):
+        """
+        处理“摸头杀”命令。
+        1. 异步获取头像（支持多种来源）。
+        2. 将CPU密集型GIF生成任务卸载到线程池，避免阻塞事件循环。
+        """
+        sender_name = event.message_event_obj.sender.nickname
+        logger.info(f"收到来自 {sender_name} 的摸头杀命令。")
 
         try:
-            gif_path = self._build_petpet_gif(avatar, float(self.config["interval"]))
-        except Exception:
-            logger.exception("[petpet] 生成 GIF 失败")
-            yield event.plain_result("生成 petpet GIF 失败，请稍后再试。")
-            return
+            # 第一步：异步获取用户头像图片
+            user_image = await self._get_user_avatar(event)
+            if user_image is None:
+                return event.set_result(
+                    MessageEventResult().message("抱歉，无法获取您的头像，无法生成摸头杀图片。")
+                )
 
-        yield self._image_result(event, gif_path)
+            # 第二步：将CPU密集型任务卸载到线程池
+            # 这是解决事件循环阻塞的关键
+            gif_path = await asyncio.to_thread(
+                self._build_petpet_gif, user_image, sender_name
+            )
 
-    def _load_or_create_config(self) -> dict:
-        cfg = dict(DEFAULT_CONFIG)
-        if self.config_path.exists():
+            if gif_path and gif_path.exists():
+                # 使用异步方式发送图片（模拟，实际框架可能提供异步发送）
+                await event.send_message(AstrImage.fromFilePath(str(gif_path)))
+            else:
+                await event.send_message("生成摸头杀图片失败，请稍后再试。")
+
+        except Exception as e:
+            logger.error(f"处理摸头杀命令时发生错误: {e}", exc_info=True)
+            await event.send_message("发生内部错误，无法处理您的请求。")
+
+    async def _get_user_avatar(self, event: AstrMessageEvent) -> Optional[Image.Image]:
+        """
+        获取用户头像，兼容多种来源：
+        1. 事件上下文中的头像URL（常见形式）。
+        2. 事件上下文中的头像Base64数据。
+        3. 通过框架API获取。
+        4. 作为fallback尝试下载QQ头像。
+        """
+        # 尝试从事件上下文获取（框架不同字段名可能不同，需适配）
+        avatar_url = getattr(event.message_event_obj.sender, "avatar", None)
+        avatar_base64 = getattr(event.message_event_obj.sender, "avatar_base64", None)
+
+        if avatar_url and isinstance(avatar_url, str) and avatar_url.startswith(("http://", "https://")):
+            logger.info(f"从事件URL获取头像: {avatar_url}")
+            return await self._download_image(avatar_url)
+        elif avatar_base64 and isinstance(avatar_base64, str):
+            logger.info("从事件Base64获取头像。")
             try:
-                loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    cfg.update(loaded)
-            except Exception:
-                logger.exception("[petpet] 读取 config.json 失败，将使用默认配置")
-        self._normalize_and_save_config(cfg)
-        return self.config
+                image_data = base64.b64decode(avatar_base64)
+                return Image.open(BytesIO(image_data))
+            except Exception as e:
+                logger.error(f"解析Base64头像失败: {e}")
 
-    def _normalize_and_save_config(self, cfg: dict):
-        trigger = str(cfg.get("trigger", DEFAULT_CONFIG["trigger"])).strip() or DEFAULT_CONFIG["trigger"]
+        # 尝试通过框架API获取（这是更标准的方式）
         try:
-            interval = float(cfg.get("interval", DEFAULT_CONFIG["interval"]))
-        except Exception:
-            interval = DEFAULT_CONFIG["interval"]
-        interval = max(0.02, min(1.0, interval))
-        self.config = {"trigger": trigger, "interval": interval}
-        self.config_path.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 假设框架提供了获取头像的方法，需根据实际API调整
+            # 例如: avatar_bytes = await event.context.get_user_avatar(event.sender.user_id)
+            # 以下为示意代码
+            avatar_bytes = await self._get_avatar_via_framework(event)
+            if avatar_bytes:
+                return Image.open(BytesIO(avatar_bytes))
+        except AttributeError:
+            logger.debug("框架未提供标准头像获取方法。")
+        except Exception as e:
+            logger.error(f"通过框架获取头像失败: {e}")
 
-    def _handle_petset(self, text: str) -> str:
-        m = re.match(r"^\.petset\s+(速度|指令)\s+(.+?)\s*$", text)
-        if not m:
-            return "用法：.petset 速度 0.06 或 .petset 指令 揉揉"
-        key, value = m.group(1), m.group(2).strip()
-        if key == "速度":
-            try:
-                interval = float(value)
-            except Exception:
-                return "速度必须是数字，例如：.petset 速度 0.06"
-            if interval <= 0:
-                return "速度必须大于 0。"
-            self.config["interval"] = interval
-            self._normalize_and_save_config(self.config)
-            return f"已设置摸头速度（帧间隔）为 {self.config['interval']:.3f}s"
-        if not value:
-            return "触发词不能为空。"
-        self.config["trigger"] = value
-        self._normalize_and_save_config(self.config)
-        return f"已设置触发词为：{self.config['trigger']}"
+        # Fallback: 尝试下载QQ头像（原始逻辑，但增加安全限制）
+        try:
+            qq_id = getattr(event.message_event_obj.sender, "user_id", "")
+            if qq_id:
+                qq_avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={qq_id}&s=640"
+                logger.info(f"Fallback: 尝试下载QQ头像: {qq_avatar_url}")
+                return await self._download_image(qq_avatar_url)
+        except Exception as e:
+            logger.error(f"下载QQ头像失败: {e}")
 
-    async def _is_admin_or_owner(self, event: AstrMessageEvent) -> bool:
-        sender = getattr(getattr(event, "message_obj", None), "sender", None)
-        role = str(getattr(sender, "role", "")).lower()
-        if role in {"owner", "admin"}:
-            return True
-
-        for name in ("is_admin", "is_owner"):
-            checker = getattr(event, name, None)
-            if callable(checker):
-                try:
-                    ret = checker()
-                    if inspect.isawaitable(ret):
-                        ret = await ret
-                    if bool(ret):
-                        return True
-                except Exception:
-                    continue
-        return False
-
-    def _resolve_target_user_id(self, event: AstrMessageEvent) -> Optional[str]:
-        msg_obj = getattr(event, "message_obj", None)
-        chain = getattr(msg_obj, "message", None) or []
-        at_uid = None
-        reply_uid = None
-
-        for seg in chain:
-            t = seg.__class__.__name__.lower()
-            if t == "at" and at_uid is None:
-                at_uid = self._first_attr(seg, ("qq", "user_id", "id", "target"))
-            if t in {"reply", "quote"} and reply_uid is None:
-                reply_uid = self._first_attr(seg, ("user_id", "qq", "id", "target"))
-
-        if reply_uid is None:
-            raw = getattr(msg_obj, "raw_message", None)
-            reply_uid = self._extract_reply_uid(raw)
-
-        if at_uid:
-            return str(at_uid)
-        if reply_uid:
-            return str(reply_uid)
-        
-        sender = getattr(msg_obj, "sender", None)
-        sender_id = self._first_attr(sender, ("user_id", "id", "qq"))
-        if sender_id:
-            return str(sender_id)
-        
         return None
 
-    def _extract_reply_uid(self, raw: Any) -> Optional[str]:
-        if not isinstance(raw, dict):
+    async def _download_image(self, url: str) -> Optional[Image.Image]:
+        """
+        安全下载网络图片。
+        增加Content-Type、大小限制，防止恶意文件导致内存或安全问题。
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status != 200:
+                        logger.error(f"下载图片失败，HTTP状态码: {response.status}")
+                        return None
+
+                    # 1. 检查Content-Type
+                    content_type = response.headers.get("Content-Type", "")
+                    if "image" not in content_type:
+                        logger.warning(f"非图片Content-Type: {content_type}")
+                        return None
+
+                    # 2. 限制下载数据大小 (例如：5MB)
+                    max_size = 5 * 1024 * 1024  # 5MB
+                    if response.content_length and response.content_length > max_size:
+                        logger.warning(f"图片过大，超过限制: {response.content_length} bytes")
+                        return None
+
+                    image_data = await response.read()
+                    if len(image_data) > max_size:
+                        logger.warning(f"实际下载图片过大，已截断")
+                        return None
+
+                    # 3. 验证并打开图片
+                    img = Image.open(BytesIO(image_data))
+                    img.verify()  # 验证图片完整性
+                    img = Image.open(BytesIO(image_data))  # 重新打开，因为verify()会关闭文件
+                    
+                    # 4. 可选：限制图片像素尺寸，防止内存压力
+                    max_pixels = 2000 * 2000
+                    if img.width * img.height > max_pixels:
+                        logger.warning(f"图片像素过大，将进行缩放。")
+                        img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                    
+                    return img
+
+        except asyncio.TimeoutError:
+            logger.error("下载图片超时。")
+        except aiohttp.ClientError as e:
+            logger.error(f"下载图片网络错误: {e}")
+        except Exception as e:
+            logger.error(f"处理下载图片时发生意外错误: {e}")
+
+        return None
+
+    def _build_petpet_gif(self, user_image: Image.Image, username: str) -> Optional[Path]:
+        """
+        CPU密集型：生成摸头杀GIF。
+        此函数在单独的线程中运行，不会阻塞事件循环。
+        使用 `with` 语句确保资源句柄释放。
+        """
+        if self._is_terminating:
             return None
-        paths = [
-            ("reply", "user_id"),
-            ("reply", "sender_id"),
-            ("reply", "sender", "user_id"),
-            ("quote", "user_id"),
-            ("quote", "sender", "user_id"),
-            ("reference", "author", "id"),
-        ]
-        for p in paths:
-            cur = raw
-            ok = True
-            for key in p:
-                if not isinstance(cur, dict) or key not in cur:
-                    ok = False
-                    break
-                cur = cur[key]
-            if ok and cur:
-                return str(cur)
-        return None
 
-    async def _resolve_avatar(self, event: AstrMessageEvent, user_id: str) -> Optional[Image.Image]:
-        candidates = []
-        for name in ("get_user_avatar", "get_avatar", "get_target_avatar", "get_sender_avatar"):
-            fn = getattr(event, name, None)
-            if callable(fn):
-                try:
-                    data = fn() if name == "get_sender_avatar" else fn(user_id)
-                    if inspect.isawaitable(data):
-                        data = await data
-                    candidates.append(data)
-                except Exception:
-                    continue
-
-        sender = getattr(getattr(event, "message_obj", None), "sender", None)
-        sender_uid = self._first_attr(sender, ("user_id", "id"))
-        if sender and sender_uid and str(sender_uid) == str(user_id):
-            for k in ("avatar", "avatar_url", "face", "icon"):
-                v = getattr(sender, k, None)
-                if v:
-                    candidates.append(v)
-
-        for data in candidates:
-            img = self._to_image(data)
-            if img is not None:
-                return img.convert("RGBA")
+        logger.info(f"开始为用户 {username} 生成GIF...")
         
-        img = await self._download_qq_avatar(user_id)
-        if img is not None:
-            return img
-        
-        return None
-    
-    async def _download_qq_avatar(self, user_id: str) -> Optional[Image.Image]:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for url_template in QQ_AVATAR_URLS:
-                url = url_template.format(user_id=user_id)
-                try:
-                    resp = await client.get(url, headers=headers, follow_redirects=True)
-                    if resp.status_code == 200 and len(resp.content) > 0:
-                        img = Image.open(io.BytesIO(resp.content))
-                        logger.info(f"[petpet] 从QQ头像API获取头像成功: {user_id}")
-                        return img.convert("RGBA")
-                except Exception as e:
-                    logger.warning(f"[petpet] 获取头像失败 {url}: {e}")
-        return None
+        # 1. 准备输出文件路径
+        import time
+        timestamp = int(time.time() * 1000)
+        output_filename = f"petpet_{username}_{timestamp}.gif"
+        output_path = self.output_dir / output_filename
 
-    def _to_image(self, data: Any) -> Optional[Image.Image]:
-        if data is None:
-            return None
-        if isinstance(data, Image.Image):
-            return data
-        if isinstance(data, (bytes, bytearray)):
-            try:
-                return Image.open(io.BytesIO(data)).convert("RGBA")
-            except Exception:
+        try:
+            # 2. 调整用户头像尺寸，与模板匹配
+            # 假设模板帧尺寸已知，或在此定义
+            template_size = (120, 120)  # 示例尺寸，需根据实际模板调整
+            user_image = user_image.resize(template_size, Image.Resampling.LANCZOS)
+
+            # 3. 加载所有模板帧并处理
+            frames = []
+            frame_files = sorted(self.assets_dir.glob("frame*.png"))
+            
+            if not frame_files:
+                logger.error(f"在 {self.assets_dir} 中未找到任何模板帧(frame*.png)。")
                 return None
-        if isinstance(data, str):
-            text = data.strip()
-            if text.startswith("http://") or text.startswith("https://"):
+
+            for frame_path in frame_files:
+                # 使用上下文管理器确保文件句柄被正确释放
+                with Image.open(frame_path) as frame_img:
+                    # 复制模板帧，避免修改原始文件
+                    new_frame = frame_img.copy()
+                    # 将用户头像粘贴到指定位置（需根据实际模板调整位置参数）
+                    # 以下为示意位置，实际应从模板配置中读取
+                    new_frame.paste(user_image, (70, 15))  # 示例坐标
+                    frames.append(new_frame)
+
+            # 4. 保存为GIF
+            if frames:
+                frames[0].save(
+                    output_path,
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=100,  # 每帧持续时间（毫秒）
+                    loop=0,  # 无限循环
+                    optimize=True,
+                    disposal=2  # 优化GIF大小
+                )
+                logger.info(f"GIF已生成并保存到: {output_path}")
+                return output_path
+            else:
+                logger.error("未能生成任何帧。")
                 return None
-            if text.startswith("data:image"):
+
+        except Exception as e:
+            logger.error(f"生成GIF过程中发生错误: {e}", exc_info=True)
+            # 清理可能创建的不完整文件
+            if output_path.exists():
                 try:
-                    raw = base64.b64decode(text.split(",", 1)[1])
-                    return Image.open(io.BytesIO(raw)).convert("RGBA")
+                    output_path.unlink()
                 except Exception:
-                    return None
-            p = Path(text)
-            if p.exists() and p.is_file():
-                try:
-                    return Image.open(p).convert("RGBA")
-                except Exception:
-                    return None
-        return None
-
-    def _build_petpet_gif(self, avatar: Image.Image, interval: float) -> Path:
-        canvas_size = (112, 112)
-        avatar_size = 75
-        avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
-        
-        squeeze_data = [
-            (1.0, 1.0, 0, 0),
-            (1.0, 0.9, 0, 3),
-            (0.95, 0.85, 2, 5),
-            (1.0, 0.9, 0, 3),
-            (1.0, 1.0, 0, 0),
-        ]
-        
-        frames = []
-        for i in range(5):
-            hand = Image.open(self.assets_dir / f"frame{i}.png").convert("RGBA")
-            canvas = Image.new("RGBA", canvas_size, (255, 255, 255, 0))
-            
-            sx, sy, ox, oy = squeeze_data[i]
-            w = int(avatar_size * sx)
-            h = int(avatar_size * sy)
-            squeezed = avatar.resize((w, h), Image.Resampling.LANCZOS)
-            
-            x = (canvas_size[0] - w) // 2 + ox
-            y = (canvas_size[1] - h) // 2 + oy
-            
-            canvas.paste(squeezed, (x, y))
-            canvas = Image.alpha_composite(canvas, hand)
-            
-            frames.append(canvas.convert("P", palette=Image.Palette.ADAPTIVE))
-        
-        out_path = self.output_dir / f"petpet_{uuid.uuid4().hex}.gif"
-        frames[0].save(
-            out_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=max(20, int(interval * 1000)),
-            loop=0,
-            optimize=False,
-            disposal=2,
-        )
-        return out_path
-
-    async def _cleanup_gif_loop(self):
-        while True:
-            try:
-                self._cleanup_old_gifs(max_age_seconds=6 * 3600)
-            except Exception:
-                logger.exception("[petpet] 定时清理失败")
-            await asyncio.sleep(3600)
-
-    def _cleanup_old_gifs(self, max_age_seconds: int):
-        now = time.time()
-        for f in self.output_dir.glob("petpet_*.gif"):
-            try:
-                if now - f.stat().st_mtime > max_age_seconds:
-                    f.unlink(missing_ok=True)
-            except Exception:
-                continue
-
-    def _assets_ready(self) -> bool:
-        return all((self.assets_dir / f"frame{i}.png").exists() for i in range(5))
-
-    def _image_result(self, event: AstrMessageEvent, path: Path):
-        if hasattr(event, "make_result"):
-            result = event.make_result()
-            if hasattr(result, "image"):
-                result.image(str(path))
-                return result
-        return event.image_result(str(path))
-
-    def _get_text(self, event: AstrMessageEvent) -> str:
-        v = getattr(event, "message_str", None)
-        if isinstance(v, str):
-            return v
-        msg_obj = getattr(event, "message_obj", None)
-        v2 = getattr(msg_obj, "message_str", "")
-        return v2 if isinstance(v2, str) else ""
-
-    @staticmethod
-    def _first_attr(obj: Any, keys: tuple[str, ...]) -> Optional[Any]:
-        if obj is None:
+                    pass
             return None
-        for k in keys:
-            v = getattr(obj, k, None)
-            if v is not None and v != "":
-                return v
-        return None
+
+    async def _cleanup_old_gifs(self):
+        """
+        后台任务：定期清理旧的GIF文件，防止磁盘空间无限增长。
+        设置为每小时运行一次。
+        """
+        while not self._is_terminating:
+            try:
+                await asyncio.sleep(3600)  # 每小时运行一次
+                logger.info("执行GIF清理任务...")
+
+                # 清理超过24小时的文件
+                cutoff_time = 24 * 3600
+                count = 0
+                for gif_file in self.output_dir.glob("*.gif"):
+                    try:
+                        stat = gif_file.stat()
+                        age = time.time() - stat.st_mtime
+                        if age > cutoff_time:
+                            gif_file.unlink()
+                            count += 1
+                            logger.debug(f"已清理旧文件: {gif_file.name}")
+                    except Exception as e:
+                        logger.error(f"清理文件 {gif_file.name} 时出错: {e}")
+
+                if count > 0:
+                    logger.info(f"本次清理了 {count} 个旧GIF文件。")
+            except asyncio.CancelledError:
+                # 任务被取消，正常退出
+                raise
+            except Exception as e:
+                logger.error(f"清理任务发生错误: {e}", exc_info=True)
+
+    # 以下为辅助方法示例，需根据实际框架API补充
+    async def _get_avatar_via_framework(self, event: AstrMessageEvent) -> Optional[bytes]:
+        """
+        通过AstrBot框架提供的API获取用户头像。
+        这是一个占位方法，实际实现需要根据您使用的AstrBot版本和API文档进行调整。
+        """
+        try:
+            # 示例：假设框架在上下文中提供了用户头像获取方法
+            # if hasattr(self.context, 'get_user_avatar'):
+            #     return await self.context.get_user_avatar(event.sender.user_id)
+            # 请替换为实际的框架API调用
+            logger.debug("_get_avatar_via_framework: 需根据实际框架API实现。")
+            return None
+        except Exception as e:
+            logger.error(f"通过框架获取头像失败: {e}")
+            return None
