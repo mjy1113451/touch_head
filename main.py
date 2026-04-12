@@ -26,7 +26,8 @@ class TouchHeadPlugin(star.Star):
         logger.info("摸头杀插件正在初始化...")
 
         # 1. 使用规范的数据持久化目录
-        self.data_dir = Path(StarTools.get_data_dir())
+        # StarTools.get_data_dir() 返回的已经是Path对象，无需再次包裹
+        self.data_dir = StarTools.get_data_dir()
         self.output_dir = self.data_dir / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -121,15 +122,21 @@ class TouchHeadPlugin(star.Star):
                 if len(image_data) > 5 * 1024 * 1024:
                     logger.warning("Base64头像过大，超过5MB限制")
                     return None
-                # 安全验证：使用Pillow验证并检查像素
-                img = Image.open(BytesIO(image_data))
-                img.verify()  # 验证图片完整性
-                img = Image.open(BytesIO(image_data))  # verify()后需重新打开
-                # 检查像素上限
-                if img.width * img.height > Image.MAX_IMAGE_PIXELS:
-                    logger.warning(f"Base64头像像素过大: {img.width}x{img.height}")
+                # 安全验证：使用Pillow验证
+                try:
+                    with Image.open(BytesIO(image_data)) as img:
+                        img.verify()  # 验证图片完整性
+                except Exception:
+                    logger.error("Base64头像验证失败")
                     return None
-                return img
+
+                # verify()后重新打开进行像素检查和处理
+                with Image.open(BytesIO(image_data)) as img:
+                    if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+                        logger.warning(f"Base64头像像素过大: {img.width}x{img.height}")
+                        return None
+                    # 返回图像的副本，避免上下文关闭后图像失效
+                    return img.copy()
             except Exception as e:
                 logger.error(f"解析Base64头像失败: {e}")
 
@@ -141,13 +148,19 @@ class TouchHeadPlugin(star.Star):
                 if len(avatar_bytes) > 5 * 1024 * 1024:
                     logger.warning("框架头像过大，超过5MB限制")
                     return None
-                img = Image.open(BytesIO(avatar_bytes))
-                img.verify()
-                img = Image.open(BytesIO(avatar_bytes))
-                if img.width * img.height > Image.MAX_IMAGE_PIXELS:
-                    logger.warning(f"框架头像像素过大: {img.width}x{img.height}")
+                # 使用with上下文管理器验证
+                try:
+                    with Image.open(BytesIO(avatar_bytes)) as img:
+                        img.verify()
+                except Exception:
+                    logger.error("框架头像验证失败")
                     return None
-                return img
+
+                with Image.open(BytesIO(avatar_bytes)) as img:
+                    if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+                        logger.warning(f"框架头像像素过大: {img.width}x{img.height}")
+                        return None
+                    return img.copy()
         except AttributeError:
             logger.debug("框架未提供标准头像获取方法。")
         except Exception as e:
@@ -198,16 +211,19 @@ class TouchHeadPlugin(star.Star):
                         return None
 
                 # 4. 验证并打开图片
-                img = Image.open(BytesIO(image_data))
-                img.verify()
-                img = Image.open(BytesIO(image_data))
-
-                # 5. 检查像素尺寸
-                if img.width * img.height > Image.MAX_IMAGE_PIXELS:
-                    logger.warning(f"图片像素过大: {img.width}x{img.height}")
+                try:
+                    with Image.open(BytesIO(image_data)) as img:
+                        img.verify()
+                except Exception:
+                    logger.error("下载图片验证失败")
                     return None
 
-                return img
+                # 5. 检查像素尺寸并返回副本
+                with Image.open(BytesIO(image_data)) as img:
+                    if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+                        logger.warning(f"图片像素过大: {img.width}x{img.height}")
+                        return None
+                    return img.copy()
 
         except asyncio.TimeoutError:
             logger.error("下载图片超时。")
