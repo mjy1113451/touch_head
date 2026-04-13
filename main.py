@@ -235,7 +235,7 @@ class TouchHeadPlugin(star.Star):
         return None
 
     def _build_petpet_gif(self, user_image: Image.Image, username: str) -> Optional[Path]:
-        """ CPU密集型：生成摸头杀GIF。 此函数在单独的线程中运行，不会阻塞事件循环。 使用 `with` 语句确保资源句柄释放。 """
+        """ CPU密集型：生成摸头杀GIF。 正确处理图层顺序：头像在下，手在上，使用alpha通道混合。 此函数在单独的线程中运行，不会阻塞事件循环。 """
         if self._is_terminating:
             return None
 
@@ -243,35 +243,54 @@ class TouchHeadPlugin(star.Star):
 
         # 1. 准备输出文件路径 - 清洗用户名防止路径注入
         timestamp = int(time.time() * 1000)
-        # 清洗用户名：移除危险字符，限制长度
         safe_username = re.sub(r'[/\\<>:"|?*\x00-\x1f]', '_', username)
-        safe_username = safe_username[:50]  # 限制长度50字符
+        safe_username = safe_username[:50]
         output_filename = f"petpet_{safe_username}_{timestamp}.gif"
         output_path = self.output_dir / output_filename
 
         try:
-            # 2. 调整用户头像尺寸，与模板匹配
-            # 假设模板帧尺寸已知，或在此定义
-            template_size = (120, 120)  # 示例尺寸，需根据实际模板调整
-            user_image = user_image.resize(template_size, Image.Resampling.LANCZOS)
+            # 2. 调整用户头像尺寸并转换为RGBA模式
+            avatar_size = (100, 100)
+            user_image = user_image.convert("RGBA").resize(avatar_size, Image.Resampling.LANCZOS)
 
             # 3. 加载所有模板帧并处理
             frames = []
             frame_files = sorted(self.assets_dir.glob("frame*.png"))
-            
+
             if not frame_files:
                 logger.error(f"在 {self.assets_dir} 中未找到任何模板帧(frame*.png)。")
                 return None
 
-            for frame_path in frame_files:
-                # 使用上下文管理器确保文件句柄被正确释放
-                with Image.open(frame_path) as frame_img:
-                    # 复制模板帧，避免修改原始文件
-                    new_frame = frame_img.copy()
-                    # 将用户头像粘贴到指定位置（需根据实际模板调整位置参数）
-                    # 以下为示意位置，实际应从模板配置中读取
-                    new_frame.paste(user_image, (70, 15))  # 示例坐标
-                    frames.append(new_frame)
+            for i, frame_path in enumerate(frame_files):
+                with Image.open(frame_path) as hand_frame:
+                    # 转换为RGBA模式以支持透明通道
+                    hand_frame = hand_frame.convert("RGBA")
+
+                    # 创建新画布（与手图层相同尺寸）
+                    canvas = Image.new("RGBA", hand_frame.size, (255, 255, 255, 0))
+
+                    # 计算头像位置（居中偏下）
+                    avatar_x = (canvas.width - avatar_size[0]) // 2
+                    avatar_y = (canvas.height - avatar_size[1]) // 2 + 10
+
+                    # 根据帧索引添加变形效果（模拟被摸时的挤压）
+                    deformation = self._calculate_deformation(i, len(frame_files))
+                    if deformation != 1.0:
+                        # 应用变形：水平挤压
+                        new_width = int(avatar_size[0] * deformation)
+                        avatar_frame = user_image.resize((new_width, avatar_size[1]), Image.Resampling.LANCZOS)
+                        avatar_x = (canvas.width - new_width) // 2
+                    else:
+                        avatar_frame = user_image
+
+                    # 1. 先粘贴头像（底层）- 使用alpha通道
+                    canvas.paste(avatar_frame, (avatar_x, avatar_y), avatar_frame)
+
+                    # 2. 再粘贴手图层（上层）- 使用alpha混合
+                    canvas = Image.alpha_composite(canvas, hand_frame)
+
+                    # 转换为RGB模式（GIF不支持RGBA）
+                    frames.append(canvas.convert("RGB"))
 
             # 4. 保存为GIF
             if frames:
@@ -279,10 +298,10 @@ class TouchHeadPlugin(star.Star):
                     output_path,
                     save_all=True,
                     append_images=frames[1:],
-                    duration=100,  # 每帧持续时间（毫秒）
-                    loop=0,  # 无限循环
+                    duration=100,
+                    loop=0,
                     optimize=True,
-                    disposal=2  # 优化GIF大小
+                    disposal=2
                 )
                 logger.info(f"GIF已生成并保存到: {output_path}")
                 return output_path
@@ -292,13 +311,23 @@ class TouchHeadPlugin(star.Star):
 
         except Exception as e:
             logger.error(f"生成GIF过程中发生错误: {e}", exc_info=True)
-            # 清理可能创建的不完整文件
             if output_path.exists():
                 try:
                     output_path.unlink()
                 except Exception:
                     pass
             return None
+
+    def _calculate_deformation(self, frame_index: int, total_frames: int) -> float:
+        """ 计算头像变形系数，模拟被摸时的挤压效果。 返回1.0表示无变形，<1.0表示水平挤压。 """
+        import math
+        if total_frames <= 1:
+            return 1.0
+        progress = frame_index / (total_frames - 1)
+        # 正弦波变形，中间帧挤压最明显
+        deformation_factor = math.sin(progress * math.pi)
+        # 映射到 0.85 - 1.0 范围（最大挤压到85%宽度）
+        return 0.85 + 0.15 * (1 - deformation_factor)
 
     async def _cleanup_old_gifs(self):
         """ 后台任务：定期清理旧的GIF文件，防止磁盘空间无限增长。 设置为每小时运行一次。 """
